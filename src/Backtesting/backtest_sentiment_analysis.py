@@ -1,102 +1,76 @@
 import backtrader as bt
-from datetime import datetime
-import pandas as pd
 import yfinance as yf
-import logging
+import pandas as pd
+from dotenv import load_dotenv
+import os
 from crewai import Crew
-from src.Agents.Analysis.stock_analysis_agents import StockAnalysisAgents  # Correct import for StockAnalysisAgents
-from src.Agents.Analysis.stock_analysis_tasks import StockAnalysisTasks    # Correct import for StockAnalysisTasks
-from src.UI.sentiment_analysis import SentimentCrew 
+from src.Agents.Analysis.stock_analysis_agents import StockAnalysisAgents
+from src.Agents.Analysis.stock_analysis_tasks import StockAnalysisTasks
+import sys
+import numpy as np
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Load environment variables
+load_dotenv()
 
-class SentimentCrew:
-    def __init__(self, stock_or_sector):
-        self.stock_or_sector = stock_or_sector
-
-    def run(self):
-        agents = StockAnalysisAgents()
-        tasks = StockAnalysisTasks()
-
-        # Initialize a sentiment analysis agent and task
-        sentiment_agent = agents.sentiment_analyst()
-        sentiment_task = tasks.analyze_sentiment(sentiment_agent, self.stock_or_sector)
-
-        # Set up CrewAI and run the sentiment analysis
-        crew = Crew(
-            agents=[sentiment_agent],
-            tasks=[sentiment_task],
-            verbose=False
-        )
-
-        result = crew.kickoff()
-        return result  # Expected to return a sentiment score or buy/sell decision
-
-class SentimentBasedStrategy(bt.Strategy):
+class SentimentAnalysisCrewAIStrategy(bt.Strategy):
     params = dict(
-        stock='AAPL',
+        stock_or_sector='AAPL',
+        data_df=None,  # Add data_df as a parameter
+        printlog=True,
     )
 
     def __init__(self):
         self.dataclose = self.datas[0].close
         self.order = None
 
-        # Run sentiment analysis only once during initialization
-        self.sentiment_crew = SentimentCrew(self.params.stock)
-        sentiment_output = self.sentiment_crew.run()
+        # Use the data_df passed in via params
+        data_df = self.params.data_df
 
-        # Process sentiment output and decide on trading action
-        self.sentiment_decision = self.parse_sentiment(sentiment_output)
+        # Initialize agents and tasks
+        agents = StockAnalysisAgents()
+        tasks = StockAnalysisTasks()
+        self.sentiment_analyst = agents.sentiment_analyst()
 
-        # Log the initial sentiment decision for clarity
-        print(f"Initial Sentiment Decision: {self.sentiment_decision}")
+        # Simulate sentiment scores over the data
+        # For the sake of example, we can simulate sentiment scores as random numbers or based on price changes
 
-    def parse_sentiment(self, sentiment_output):
-        try:
-            # Access the sentiment text
-            if hasattr(sentiment_output, 'tasks_output') and sentiment_output.tasks_output:
-                task_output = sentiment_output.tasks_output[0]
-                
-                # Check if there is a sentiment summary or description
-                sentiment_text = ""
-                if hasattr(task_output, 'summary'):
-                    sentiment_text = task_output.summary.lower()
-                elif hasattr(task_output, 'description'):
-                    sentiment_text = task_output.description.lower()
-                
-                # Basic keyword search in sentiment text
-                if 'buy' in sentiment_text or 'positive' in sentiment_text or 'stability' in sentiment_text:
-                    return 'buy'
-                elif 'sell' in sentiment_text or 'negative' in sentiment_text or 'caution' in sentiment_text:
-                    return 'sell'
-                else:
-                    # If sentiment score is present, decide based on threshold
-                    if 'score' in sentiment_text:
-                        score = float(sentiment_text.split("score")[1].strip().split()[0])
-                        if score > 0.3:  # Threshold for positive sentiment
-                            return 'buy'
-                        elif score < -0.3:  # Threshold for negative sentiment
-                            return 'sell'
-                    return 'hold'
+        # Let's create a Series to hold the sentiment scores with the same index as data_df
+        self.sentiment_scores = pd.Series(index=data_df.index, dtype=float)
+
+        # For simplicity, let's assume that if the close price increased compared to previous day, sentiment is positive
+        # If close price decreased, sentiment is negative
+        close_prices = data_df['Close']
+        self.sentiment_scores.iloc[0] = 0  # Neutral sentiment on the first day
+        for i in range(1, len(close_prices)):
+            if close_prices.iloc[i] > close_prices.iloc[i -1]:
+                self.sentiment_scores.iloc[i] = 1  # Positive sentiment
+            elif close_prices.iloc[i] < close_prices.iloc[i -1]:
+                self.sentiment_scores.iloc[i] = -1  # Negative sentiment
             else:
-                print("Warning: Sentiment output 'tasks_output' is unavailable or empty.")
-                return 'hold'
-        except Exception as e:
-            print("Error parsing sentiment output:", e)
-            return 'hold'
+                self.sentiment_scores.iloc[i] = 0  # Neutral sentiment
+
+        # Alternatively, you could simulate sentiment scores with random numbers
+        # self.sentiment_scores = pd.Series(np.random.uniform(-1, 1, len(data_df)), index=data_df.index)
 
     def next(self):
-        # Trade based on stored sentiment decision
-        if not self.position and self.sentiment_decision == 'buy':
-            cash = self.broker.getcash()
-            size = int((cash * 1.0) // self.dataclose[0])
-            self.order = self.buy(size=size)
-            self.log(f'BUY CREATE, {self.dataclose[0]:.2f}')
+        # Get the current datetime as a pandas Timestamp
+        current_datetime = self.datas[0].datetime.datetime(0)
+        current_date = pd.Timestamp(current_datetime).normalize()
 
-        elif self.position and self.sentiment_decision == 'sell':
-            self.order = self.sell(size=self.position.size)
-            self.log(f'SELL CREATE, {self.dataclose[0]:.2f}')
+        close_price = self.dataclose[0]
+
+        # Get the sentiment score for the current date
+        sentiment_score = self.sentiment_scores.loc[current_date]
+
+        # Trading logic based on sentiment score
+        if sentiment_score > 0 and not self.position:
+            self.order = self.buy()
+            if self.params.printlog:
+                self.log(f'BUY CREATE, {close_price:.2f}, Sentiment Score: {sentiment_score}')
+        elif sentiment_score < 0 and self.position:
+            self.order = self.sell()
+            if self.params.printlog:
+                self.log(f'SELL CREATE, {close_price:.2f}, Sentiment Score: {sentiment_score}')
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
@@ -108,44 +82,69 @@ class SentimentBasedStrategy(bt.Strategy):
                 self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}')
             elif order.issell():
                 self.log(f'SELL EXECUTED, Price: {order.executed.price:.2f}')
-            self.bar_executed = len(self)
         self.order = None
 
     def notify_trade(self, trade):
         if trade.isclosed:
             self.log(f'OPERATION PROFIT, GROSS {trade.pnl:.2f}, NET {trade.pnlcomm:.2f}')
 
+# New Buy and Hold Strategy
+class BuyAndHoldStrategy(bt.Strategy):
+    params = dict(
+        printlog=True,
+    )
 
-
-class BuyAndHold(bt.Strategy):
     def __init__(self):
-        self.dataclose = self.datas[0].close
         self.order = None
+        self.dataclose = self.datas[0].close
 
     def next(self):
-        if not self.position:
-            cash = self.broker.getcash()
-            size = int(cash // self.dataclose[0])
-            self.buy(size=size)
-            self.log(f'BUY CREATE, {self.dataclose[0]:.2f}')
+        # Buy on the first day
+        if len(self) == 1:
+            size = int(self.broker.getcash() / self.dataclose[0])
+            self.order = self.buy(size=size)
+            if self.params.printlog:
+                self.log(f'BUY CREATE, {self.dataclose[0]:.2f}, Size: {size}')
 
     def log(self, txt, dt=None):
-        dt = dt or self.datas[0].datetime.date(0)
-        print(f'{dt.isoformat()} {txt}')
+        if self.params.printlog:
+            dt = dt or self.datas[0].datetime.date(0)
+            print(f'{dt.isoformat()} {txt}')
 
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}')
+        self.order = None
 
-def run_strategy(strategy_class, strategy_name, data_df, stock=None):
+def run_strategy(strategy_class, strategy_name, data_df, **kwargs):
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(100000.0)
     cerebro.broker.setcommission(commission=0.001)
 
-    data = bt.feeds.PandasData(dataname=data_df)
+    # Create the data feed with adjusted column names
+    data = bt.feeds.PandasData(
+        dataname=data_df,
+        datetime=None,  # Use index as datetime
+        open='Open',
+        high='High',
+        low='Low',
+        close='Close',
+        volume='Volume',
+        openinterest=-1
+    )
     cerebro.adddata(data)
-    
-    if stock and strategy_class == SentimentBasedStrategy:
-        cerebro.addstrategy(strategy_class, stock=stock)
+
+    # Prepare strategy arguments
+    strategy_kwargs = kwargs.copy()
+    if hasattr(strategy_class.params, 'data_df'):
+        # Strategy expects 'data_df', pass it
+        strategy_kwargs['data_df'] = data_df
     else:
-        cerebro.addstrategy(strategy_class)
+        # Strategy does not expect 'data_df', remove it if present
+        strategy_kwargs.pop('data_df', None)
+
+    cerebro.addstrategy(strategy_class, **strategy_kwargs)
 
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
@@ -155,25 +154,29 @@ def run_strategy(strategy_class, strategy_name, data_df, stock=None):
     print(f'Starting Portfolio Value: {cerebro.broker.getvalue():.2f}')
     results = cerebro.run()
     strat = results[0]
-    print(f'Final Portfolio Value: {cerebro.broker.getvalue():.2f}')
-    
+    final_portfolio_value = cerebro.broker.getvalue()
+    print(f'Final Portfolio Value: {final_portfolio_value:.2f}')
+
     sharpe = strat.analyzers.sharpe.get_analysis()
     drawdown = strat.analyzers.drawdown.get_analysis()
     timereturn = strat.analyzers.timereturn.get_analysis()
 
-    strategy_returns = pd.Series(timereturn)
-    cumulative_return = (strategy_returns + 1.0).prod() - 1.0
-
-    num_years = (data_df.index[-1] - data_df.index[0]).days / 365.25
+    cumulative_return = (final_portfolio_value / 100000.0) - 1.0
+    start_date = data_df.index[0]
+    end_date = data_df.index[-1]
+    num_years = (end_date - start_date).days / 365.25
     annual_return = (1 + cumulative_return) ** (1 / num_years) - 1 if num_years != 0 else 0.0
 
     print(f'\n{strategy_name} Performance Metrics:')
+    print('----------------------------------------')
     print(f"Sharpe Ratio: {sharpe.get('sharperatio', 'N/A')}")
     print(f"Total Return: {cumulative_return * 100:.2f}%")
     print(f"Annual Return: {annual_return * 100:.2f}%")
     print(f"Max Drawdown: {drawdown.max.drawdown:.2f}%")
 
-    cerebro.plot(style='candlestick')
+    # Plot the strategy results (comment out if not needed)
+    # cerebro.plot(style='candlestick')
+
     return {
         'strategy_name': strategy_name,
         'sharpe_ratio': sharpe.get('sharperatio', 'N/A'),
@@ -182,13 +185,45 @@ def run_strategy(strategy_class, strategy_name, data_df, stock=None):
         'max_drawdown': drawdown.max.drawdown,
     }
 
-
 if __name__ == '__main__':
-    stock = 'AAPL'
-    data_df = yf.download(stock, start='2020-01-01', end='2024-10-30')
+    stock_or_sector = 'AAPL'
+    data_df = yf.download(stock_or_sector, start='2020-01-01', end='2023-10-30')
+
     if data_df.empty:
-        print(f"No price data found for {stock}")
+        print(f"No price data found for {stock_or_sector}")
         sys.exit()
-    
-    crewai_metrics = run_strategy(SentimentBasedStrategy, 'Sentiment-Based Strategy', data_df, stock)
-    buyhold_metrics = run_strategy(BuyAndHold, 'Buy and Hold Strategy', data_df)
+
+    # Flatten the columns if they are MultiIndex
+    if isinstance(data_df.columns, pd.MultiIndex):
+        data_df.columns = [' '.join(col).strip() for col in data_df.columns.values]
+        # Remove the ticker symbol from the column names
+        data_df.columns = [col.split(' ')[0] for col in data_df.columns]
+
+    # If you prefer to use 'Adj Close' as 'Close', rename it
+    if 'Adj Close' in data_df.columns:
+        data_df['Close'] = data_df['Adj Close']
+
+    # Remove any unnecessary columns
+    data_df = data_df[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+    # Run the Sentiment Analysis CrewAI Strategy
+    sentiment_metrics_crewai = run_strategy(
+        SentimentAnalysisCrewAIStrategy,
+        'Sentiment Analysis CrewAI Strategy',
+        data_df.copy(),
+        stock_or_sector=stock_or_sector
+    )
+
+    # Run the Non-CrewAI Buy and Hold Strategy
+    buy_and_hold_metrics = run_strategy(
+        BuyAndHoldStrategy,
+        'Non-CrewAI Buy and Hold Strategy',
+        data_df.copy()
+    )
+
+    # Compare the performance metrics
+    print("\nComparison of Strategies:")
+    print("-------------------------")
+    metrics = ['strategy_name', 'sharpe_ratio', 'total_return', 'annual_return', 'max_drawdown']
+    df_metrics = pd.DataFrame([sentiment_metrics_crewai, buy_and_hold_metrics], columns=metrics)
+    print(df_metrics.to_string(index=False))
